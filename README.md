@@ -1,59 +1,46 @@
-# CrossfitSchedule
+# WODFLOW · Competition Planner
 
-This project was generated using [Angular CLI](https://github.com/angular/angular-cli) version 22.0.8.
+Application Angular pour créer les horaires de compétitions CrossFit. L’interface utilise un nom d’utilisateur et un mot de passe; Firebase Authentication reçoit un identifiant courriel interne afin de conserver le fournisseur email/password. Chaque utilisateur retrouve ses compétitions dans sa propre branche de Firebase Realtime Database.
 
-## Development server
-
-To start a local development server, run:
+## Développement local
 
 ```bash
-ng serve
+npm install
+npm start
 ```
 
-Once the server is running, open your browser and navigate to `http://localhost:4200/`. The application will automatically reload whenever you modify any of the source files.
+Puis ouvrir `http://localhost:4200/`.
 
-## Code scaffolding
+## Firebase
 
-Angular CLI includes powerful code scaffolding tools. To generate a new component, run:
+La configuration Web se trouve dans `src/environments/environment.ts`. La base Realtime Database utilisée est :
+
+```text
+https://wodflow-4312c-default-rtdb.firebaseio.com
+```
+
+Dans la console Firebase :
+
+1. Vérifier que le fournisseur Authentication **Email/Password** est activé.
+2. Ajouter `madmoune.github.io` dans les domaines autorisés de l’Authentication.
+3. Publier les règles de sécurité présentes dans `database.rules.json` :
 
 ```bash
-ng generate component component-name
+npx firebase-tools login
+npx firebase-tools deploy --only database --project wodflow-4312c
 ```
 
-For a complete list of available schematics (such as `components`, `directives`, or `pipes`), run:
+Les règles autorisent uniquement l’utilisateur authentifié à lire et modifier `users/<uid>/competitions`.
+
+## Mode hors ligne
+
+En production, Angular installe un service worker qui met en cache l’application et ses ressources. Les compétitions sont également conservées localement par utilisateur : les modifications faites sans connexion sont placées dans une file d’attente et synchronisées automatiquement lorsque l’événement `online` est détecté.
+
+## Build et tests
 
 ```bash
-ng generate --help
+npm run build
+npm test -- --watch=false
 ```
 
-## Building
-
-To build the project run:
-
-```bash
-ng build
-```
-
-This will compile your project and store the build artifacts in the `dist/` directory. By default, the production build optimizes your application for performance and speed.
-
-## Running unit tests
-
-To execute unit tests with the [Vitest](https://vitest.dev/) test runner, use the following command:
-
-```bash
-ng test
-```
-
-## Running end-to-end tests
-
-For end-to-end (e2e) testing, run:
-
-```bash
-ng e2e
-```
-
-Angular CLI does not come with an end-to-end testing framework by default. You can choose one that suits your needs.
-
-## Additional Resources
-
-For more information on using the Angular CLI, including detailed command references, visit the [Angular CLI Overview and Command Reference](https://angular.dev/tools/cli) page.
+Le workflow `.github/workflows/deploy-pages.yml` publie l’application sur GitHub Pages à chaque push vers `main`.

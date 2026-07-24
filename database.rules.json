@@ -1,0 +1,17 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "users": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid",
+        "competitions": {
+          "$competitionId": {
+            ".validate": "newData.child('id').val() === $competitionId && newData.child('name').isString() && newData.child('date').isString()"
+          }
+        }
+      }
+    }
+  }
+}
