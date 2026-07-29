@@ -205,9 +205,8 @@
 
             @if (teamEntryMode() === 'count') {
               <form class="add-form team-entry-form" (ngSubmit)="addTeamsByCount()">
-                <div class="form-field"><label for="team-count-category">Catégorie</label><select id="team-count-category" name="teamCountCategory" [(ngModel)]="teamCountDraft.category">@for (category of categories; track category) { <option [value]="category">{{ categoryLabel(category) }}</option> }</select></div>
                 <div class="form-field"><label for="team-count">Nombre d’équipes</label><input id="team-count" name="teamCount" type="number" min="1" [(ngModel)]="teamCountDraft.count" /></div>
-                <button class="button button-dark form-submit" type="submit">Ajouter les équipes</button>
+                <button class="button button-dark form-submit" type="submit">Ajouter {{ categoryLabel(activeTeamCategory()) }}</button>
               </form>
             } @else if (teamEntryMode() === 'list') {
               <form class="team-bulk-form team-entry-form" (ngSubmit)="addTeamList()">
@@ -227,6 +226,10 @@
               @for (category of categories; track category) {
                 <button class="team-category-tab" type="button" role="tab" [class.active]="activeTeamCategory() === category" [attr.aria-selected]="activeTeamCategory() === category" (click)="activeTeamCategory.set(category)"><span class="category-dot" [class]="'category-' + category.toLowerCase()"></span><span>{{ categoryLabel(category) }}</span><strong>{{ teamCount(competition, category) }}</strong></button>
               }
+            </div>
+            <div class="team-category-actions">
+              <span class="team-category-count">{{ teamCount(competition, activeTeamCategory()) }} équipe{{ teamCount(competition, activeTeamCategory()) === 1 ? '' : 's' }} dans cette catégorie</span>
+              <button class="category-clear-button" type="button" [disabled]="teamCount(competition, activeTeamCategory()) === 0" [attr.aria-label]="'Supprimer toutes les équipes de la catégorie ' + categoryLabel(activeTeamCategory())" [title]="'Supprimer toutes les équipes de la catégorie ' + categoryLabel(activeTeamCategory())" (click)="requestDeleteTeamCategory(activeTeamCategory())">Supprimer toutes</button>
             </div>
             <div class="team-list">
               @for (team of teamsForCategory(competition, activeTeamCategory()); track team.id) {
@@ -265,6 +268,27 @@
 
         </section>
 
+        <section class="rules-section section-card" aria-labelledby="schedule-rules-title">
+          <div class="section-card-heading">
+            <div>
+              <div class="section-kicker">Règles d’optimisation</div>
+              <h2 id="schedule-rules-title">Ce que Timefold respecte</h2>
+              <p class="rules-intro">Ces règles sont appliquées par le backend local avant d’afficher l’horaire.</p>
+            </div>
+            <span class="rules-badge">Backend local</span>
+          </div>
+          <div class="rules-grid">
+            <div class="rule-item"><span>01</span><div><strong>Intervalles exclusifs</strong><p>La pause dépend du contexte : entre vagues, entre catégories ou avant le prochain WOD. Ces temps ne s’additionnent pas.</p></div></div>
+            <div class="rule-item"><span>02</span><div><strong>Horaire secondaire</strong><p>Les catégories peuvent alterner. Deux catégories fusionnées peuvent aussi partager une même vague afin de mieux remplir les lanes.</p></div></div>
+            <div class="rule-item"><span>03</span><div><strong>Repos du floor 2</strong><p>Chaque équipe garde au moins 60 minutes avant et après un WOD du floor 2. Les pauses entre deux WODs du floor 1 suivent uniquement sa configuration.</p></div></div>
+            <div class="rule-item"><span>04</span><div><strong>Pauses prioritaires et équilibrées</strong><p>La qualité des temps de repos est favorisée dans l’ordre RX, Inter, puis Scaled/Master. Les pauses d’une même catégorie restent rapprochées et ciblent 1 h 15 ou 1 h 45.</p></div></div>
+            <div class="rule-item"><span>05</span><div><strong>Fins rapprochées</strong><p>Le floor 2 est placé avant, entre ou après les WODs principaux pour terminer le plus près possible du floor 1, selon les fenêtres de repos disponibles.</p></div></div>
+            <div class="rule-item"><span>06</span><div><strong>Ordre des équipes</strong><p>Sur l’horaire principal, les équipes suivent leur ordre d’entrée, du centre vers l’extérieur : 5, 6, 4, 7, 3, 8, 2, 9, 1, 10.</p></div></div>
+            <div class="rule-item"><span>07</span><div><strong>Minimum de vagues</strong><p>Chaque groupe utilise le moins de vagues possible, puis les équipes sont réparties également : 37 équipes donnent 10, 9, 9 et 9.</p></div></div>
+            <div class="rule-item"><span>08</span><div><strong>Horaires sauvegardés</strong><p>Chaque horaire généré reçoit son propre nom. Toutes les versions sont conservées avec la compétition, sélectionnables et supprimables avec confirmation.</p></div></div>
+          </div>
+        </section>
+
         <section class="generated-section" id="generated-schedule">
           <div class="generated-heading">
             <div>
@@ -272,8 +296,33 @@
               <h2>Horaire de la compétition</h2>
               <p>Une vue prête à imprimer, avec les équipes par vague.</p>
             </div>
-            <div class="generated-actions"><span class="legend-item"><i class="legend-swatch main-swatch"></i> Floor 1</span>@if (scheduleDirty()) { <span class="schedule-dirty">Modifications non recalculées</span> }<button class="button button-quiet" type="button" (click)="recalculateSchedule()" [disabled]="optimizationBusy()">{{ optimizationBusy() ? 'Optimisation…' : '↻ Recalculer' }}</button></div>
+            <div class="generated-actions"><span class="legend-item"><i class="legend-swatch main-swatch"></i> Floor 1</span>@if (scheduleDirty()) { <span class="schedule-dirty">Modifications non générées</span> }<button class="button button-quiet export-button" type="button" (click)="exportScheduleToExcel()" [disabled]="exportBusy() || !activeSavedSchedule() || !generatedSchedule().tracks.length" title="Exporter l’horaire actif dans Excel">{{ exportBusy() ? 'Excel…' : '⇩ Excel' }}</button><div class="generation-dropdown"><button class="button button-quiet generation-main-button" type="button" (click)="openGeneratedScheduleDialog()" [disabled]="optimizationBusy()">{{ optimizationBusy() ? 'Optimisation…' : '＋ Générer ' + generatedScheduleCount + (generatedScheduleCount === 1 ? ' horaire' : ' horaires') }}</button><button class="button button-quiet generation-toggle-button" type="button" aria-label="Choisir le nombre d’horaires à générer" title="Choisir le nombre d’horaires à générer" [attr.aria-expanded]="generationMenuOpen()" (click)="toggleGenerationMenu()" [disabled]="optimizationBusy()">⌄</button>@if (generationMenuOpen()) { <div class="generation-menu" role="menu"><div class="generation-menu-label">Nombre d’horaires</div>@for (count of generationCounts; track count) { <button type="button" role="menuitem" [class.active]="generatedScheduleCount === count" (click)="openGeneratedScheduleDialog(count)">{{ count }} horaire{{ count === 1 ? '' : 's' }}</button> }</div> }</div></div>
           </div>
+
+          @if (optimizationBusy()) {
+            <div class="schedule-generation-loader" role="status" aria-live="polite">
+              <div class="generation-loader-lanes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+              <div class="generation-loader-copy">
+                <strong>Création de {{ generatedScheduleCount }} horaire{{ generatedScheduleCount === 1 ? '' : 's' }}</strong>
+                <span>Timefold compare les meilleures solutions…</span>
+              </div>
+            </div>
+          }
+
+          @if (savedSchedules().length) {
+            <div class="saved-schedules-panel">
+              <div class="saved-schedules-heading"><div><strong>Horaires sauvegardés</strong><span>Sélectionnez une version à afficher. Glissez une équipe pour l’échanger ou la déposer dans une case libre.</span></div><span class="count-badge">{{ savedSchedules().length }}</span></div>
+              <div class="saved-schedules-list">
+                @for (schedule of savedSchedules(); track schedule.id) {
+                  <div class="saved-schedule-option" [class.active]="competition.activeScheduleId === schedule.id">
+                    <button class="saved-schedule-select" type="button" [class.active]="competition.activeScheduleId === schedule.id" [attr.aria-pressed]="competition.activeScheduleId === schedule.id" (click)="selectGeneratedSchedule(schedule.id)"><strong>{{ schedule.name }}</strong><small>{{ formatSavedAt(schedule.generatedAt) }} <span>·</span> score {{ schedule.score }}</small></button>
+                    <button class="saved-schedule-delete" type="button" [attr.aria-label]="'Supprimer l’horaire ' + schedule.name" [title]="'Supprimer l’horaire ' + schedule.name" (click)="requestDeleteGeneratedSchedule(schedule)">×</button>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+          @if (generatedSchedule().generatedAt) { <div class="optimization-saved">Horaire « {{ activeSavedSchedule()?.name ?? 'sans nom' }} » sauvegardé{{ generatedSchedule().cached ? ' · résultat réutilisé' : '' }} · {{ formatSavedAt(generatedSchedule().generatedAt) }} · score {{ generatedSchedule().score }}</div> }
 
           <div class="schedule-view-tabs" role="tablist" aria-label="Vues de l’horaire">
             <button type="button" role="tab" [attr.aria-selected]="scheduleView() === 'floors'" [class.active]="scheduleView() === 'floors'" (click)="scheduleView.set('floors')">Par floor</button>
@@ -291,7 +340,7 @@
                   <div class="schedule-columns">
                     @for (group of track.groups; track group.wod.id) {
                       @for (columns of scheduleRows(group.columns); track $index) {
-                      <div class="schedule-wod-block" [class.schedule-wod-continuation]="$index > 0" [style]="'--column-count: ' + columns.length">
+                      <div class="schedule-wod-block" [class.schedule-wod-continuation]="$index > 0" [style]="'--column-count: ' + scheduleColumnsPerRow">
                         @if ($index === 0) { <div class="schedule-wod-title">{{ group.wod.name }}</div> }
                         <div class="schedule-category-row">
                           @for (categoryGroup of categoryGroupsForColumns(group, columns); track $index) {
@@ -303,11 +352,11 @@
                             <div class="schedule-wave-column">
                               <div class="schedule-wave-header">Wave {{ column.wave.number }} <span>{{ formatTimeRange(column.wave.start, column.wave.end) }}</span></div>
                               <div class="wave-list">
-                                @for (laneNumber of laneNumbersForWave(column); track laneNumber) {
+                                @for (laneNumber of laneNumbersForWave(column, track.schedule.floor); track laneNumber) {
                                   @if (column.wave.lanes.find(lane => lane.lane === laneNumber); as lane) {
-                                    <div class="schedule-team schedule-team-clickable" [class]="'schedule-team schedule-team-clickable ' + teamCategoryClass(competition, lane?.teamId ?? '')" role="button" tabindex="0" (click)="openTeamSchedule(lane.teamId)" (keydown.enter)="openTeamSchedule(lane.teamId)" (keydown.space)="openTeamSchedule(lane.teamId)"><span>{{ laneNumber }}</span>{{ competition.teams.find(team => team.id === lane?.teamId)?.name }}</div>
+                                    <div class="schedule-team schedule-team-clickable" [class]="'schedule-team schedule-team-clickable ' + teamCategoryClass(competition, lane?.teamId ?? '')" [class.schedule-team-dragging]="isDraggedSource(track, column, laneNumber)" [class.schedule-team-drop-target]="isDragTarget(track, column, laneNumber)" role="button" tabindex="0" draggable="true" title="Glisser pour déplacer ou échanger" (dragstart)="startTeamDrag($event, track, column, laneNumber, lane.teamId)" (dragend)="endTeamDrag()" (dragenter)="allowTeamDrop($event, track, column, laneNumber)" (dragover)="allowTeamDrop($event, track, column, laneNumber)" (drop)="dropTeam($event, track, column, laneNumber)" (click)="openTeamSchedule(lane.teamId)" (keydown.enter)="openTeamSchedule(lane.teamId)" (keydown.space)="openTeamSchedule(lane.teamId)"><span>{{ laneNumber }}</span>{{ competition.teams.find(team => team.id === lane?.teamId)?.name }}</div>
                                   } @else {
-                                    <div class="schedule-team schedule-team-empty" [class]="'schedule-team schedule-team-empty ' + (column.generatedWod.categories.length > 1 ? 'category-pair' : 'category-' + column.generatedWod.category.toLowerCase())"><span>{{ laneNumber }}</span></div>
+                                    <div class="schedule-team schedule-team-empty" [class]="'schedule-team schedule-team-empty ' + (column.generatedWod.categories.length > 1 ? 'category-pair' : 'category-' + column.generatedWod.category.toLowerCase())" [class.schedule-team-drop-target]="isDragTarget(track, column, laneNumber)" role="button" tabindex="0" [attr.aria-label]="'Place libre, lane ' + laneNumber" title="Déposer une équipe ici" (dragenter)="allowTeamDrop($event, track, column, laneNumber)" (dragover)="allowTeamDrop($event, track, column, laneNumber)" (drop)="dropTeam($event, track, column, laneNumber)"><span>{{ laneNumber }}</span></div>
                                   }
                                 }
                               </div>
@@ -449,14 +498,45 @@
   </div>
 }
 
+@if (generatedScheduleFormOpen()) {
+  <div class="modal-backdrop" role="presentation">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="generated-schedule-title" (click)="$event.stopPropagation()">
+      <button class="modal-close" type="button" aria-label="Fermer" (click)="closeGeneratedScheduleDialog()">×</button>
+      <div class="modal-icon">✦</div>
+      <div class="section-kicker">Nouvel horaire</div>
+      <h2 id="generated-schedule-title">Générer {{ generatedScheduleCount }} horaire{{ generatedScheduleCount === 1 ? '' : 's' }}</h2>
+      <p>Donnez un nom à chaque horaire. Les {{ generatedScheduleCount }} meilleure{{ generatedScheduleCount === 1 ? '' : 's' }} solution{{ generatedScheduleCount === 1 ? '' : 's' }} seront sauvegardées séparément.</p>
+      <form class="modal-form" (ngSubmit)="generateSchedule()">
+        <div class="generated-schedule-name-list">
+          @for (scheduleName of generatedScheduleNames; track $index; let index = $index) {
+            <div class="form-field">
+              <label [attr.for]="'generated-schedule-name-' + index">Nom de l’horaire {{ generatedScheduleCount === 1 ? '' : index + 1 }}</label>
+              <input [id]="'generated-schedule-name-' + index" [name]="'generatedScheduleName-' + index" [(ngModel)]="generatedScheduleNames[index]" [placeholder]="'Ex. Horaire ' + (index + 1)" />
+            </div>
+          }
+        </div>
+        <button class="button button-primary modal-submit" type="submit" [disabled]="!generatedScheduleNamesValid() || optimizationBusy()">{{ optimizationBusy() ? 'Optimisation…' : 'Générer ' + generatedScheduleCount + (generatedScheduleCount === 1 ? ' horaire' : ' horaires') }} <span>↗</span></button>
+      </form>
+    </div>
+  </div>
+}
+
 @if (deleteDialogOpen()) {
   <div class="modal-backdrop" role="presentation" (click)="closeDeleteDialog()">
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" (click)="$event.stopPropagation()">
       <button class="modal-close" type="button" aria-label="Fermer" (click)="closeDeleteDialog()">×</button>
       <div class="modal-icon modal-icon-danger">!</div>
       <div class="section-kicker">Confirmation</div>
-      <h2 id="delete-dialog-title">Supprimer {{ deleteTarget()?.kind === 'schedule' ? 'l’horaire' : deleteTarget()?.kind === 'wod' ? 'le WOD' : deleteTarget()?.kind === 'team' ? 'l’équipe' : 'l’association' }} ?</h2>
-      <p>« {{ deleteTarget()?.name }} » sera {{ deleteTarget()?.kind === 'categoryPair' ? 'supprimée' : 'supprimé' }} définitivement.</p>
+      @if (deleteTarget()?.kind === 'teamCategory') {
+        <h2 id="delete-dialog-title">Supprimer toutes les équipes de la catégorie {{ deleteTarget()?.name }} ?</h2>
+        <p>{{ deleteTarget()?.count }} équipe{{ deleteTarget()?.count === 1 ? '' : 's' }} de la catégorie « {{ deleteTarget()?.name }} » seront supprimées définitivement.</p>
+      } @else if (deleteTarget()?.kind === 'generatedSchedule') {
+        <h2 id="delete-dialog-title">Supprimer l’horaire généré ?</h2>
+        <p>« {{ deleteTarget()?.name }} » sera supprimé définitivement.</p>
+      } @else {
+        <h2 id="delete-dialog-title">Supprimer {{ deleteTarget()?.kind === 'schedule' ? 'l’horaire' : deleteTarget()?.kind === 'wod' ? 'le WOD' : deleteTarget()?.kind === 'team' ? 'l’équipe' : 'l’association' }} ?</h2>
+        <p>« {{ deleteTarget()?.name }} » sera {{ deleteTarget()?.kind === 'categoryPair' ? 'supprimée' : 'supprimé' }} définitivement.</p>
+      }
       @if (deleteTarget()?.kind === 'schedule') { <p class="delete-warning">Les WODs associés à cet horaire seront conservés et réassignés à un autre horaire lorsqu’il y en a un.</p> }
       <div class="modal-actions">
         <button class="button button-quiet" type="button" (click)="closeDeleteDialog()">Annuler</button>
@@ -505,5 +585,20 @@
         <div class="schedule-empty team-schedule-empty">Aucun WOD assigné à cette équipe.</div>
       }
     </div>
+  </div>
+}
+
+@if (errorToast()) {
+  <div
+    class="error-toast"
+    role="alert"
+    aria-live="assertive"
+    aria-atomic="true"
+    [style.--toast-duration]="errorToastDurationMs + 'ms'"
+  >
+    <span class="error-toast-icon" aria-hidden="true">!</span>
+    <span class="error-toast-message">{{ errorToast() }}</span>
+    <button class="error-toast-close" type="button" aria-label="Fermer le message d’erreur" (click)="dismissErrorToast()">×</button>
+    <span class="error-toast-progress" aria-hidden="true"></span>
   </div>
 }

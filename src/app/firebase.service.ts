@@ -12,7 +12,7 @@ import {
 } from 'firebase/auth';
 import { getDatabase, onValue, ref, set, type Unsubscribe as DatabaseUnsubscribe } from 'firebase/database';
 import { environment } from '../environments/environment';
-import type { Competition, Wod } from './app';
+import type { Competition, SavedSchedule, Wod } from './app';
 
 type SyncState = 'idle' | 'loading' | 'saving' | 'saved' | 'offline' | 'error';
 
@@ -252,6 +252,13 @@ export class FirebaseService implements OnDestroy {
           && rawPair.every((category) => category === 'SCALED' || category === 'MASTER' || category === 'INTER' || category === 'RX')
           ? [rawPair[0], rawPair[1]] as Competition['pairedCategories']
           : null;
+        const optimizedSchedules = this.normalizeSavedSchedules(entry['optimizedSchedules'], entry['optimizedSchedule']);
+        const rawActiveScheduleId = entry['activeScheduleId'];
+        const activeScheduleId = typeof rawActiveScheduleId === 'string'
+          && optimizedSchedules.some((schedule) => schedule.id === rawActiveScheduleId)
+          ? rawActiveScheduleId
+          : optimizedSchedules[0]?.id ?? null;
+
         return {
           id: entry['id'] as string,
           name: entry['name'] as string,
@@ -260,6 +267,8 @@ export class FirebaseService implements OnDestroy {
           wods: this.normalizeWods(entry['wods'], schedules[0]?.id ?? ''),
           teams: Array.isArray(entry['teams']) ? entry['teams'] : [],
           pairedCategories,
+          optimizedSchedules,
+          activeScheduleId,
         };
       });
   }
@@ -274,6 +283,23 @@ export class FirebaseService implements OnDestroy {
         categoryInterval: Math.max(0, Number(wod['categoryInterval']) || 0),
         scheduleId: typeof wod['scheduleId'] === 'string' ? wod['scheduleId'] : defaultScheduleId,
       }) as Wod);
+  }
+
+  private normalizeSavedSchedules(value: unknown, legacyValue: unknown): SavedSchedule[] {
+    const entries = Array.isArray(value)
+      ? value
+      : legacyValue && typeof legacyValue === 'object'
+        ? [legacyValue]
+        : [];
+
+    return entries
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')
+      .filter((entry) => Array.isArray(entry['tracks']))
+      .map((entry, index) => ({
+        ...entry,
+        id: typeof entry['id'] === 'string' && entry['id'].trim() ? entry['id'] : `saved-schedule-${index + 1}`,
+        name: typeof entry['name'] === 'string' && entry['name'].trim() ? entry['name'] : `Horaire ${index + 1}`,
+      })) as SavedSchedule[];
   }
 
   private cacheKey(uid: string): string {

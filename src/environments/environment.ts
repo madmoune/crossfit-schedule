@@ -1,5 +1,6 @@
 export const environment = {
   production: false,
+  backendUrl: 'http://localhost:8080',
   firebaseConfig: {
     apiKey: "AIzaSyATOU4oVMukkJXBlL1MDY9E_LgzS77hx8Y",
     authDomain: "wodflow-4312c.firebaseapp.com",

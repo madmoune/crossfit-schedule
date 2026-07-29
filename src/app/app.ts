@@ -1,6 +1,15 @@
-import { Component, computed, effect, inject, signal } from '@angular/core';
+import { Component, computed, effect, inject, signal, type OnDestroy, type WritableSignal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { FirebaseService } from './firebase.service';
+import {
+  BackendScheduleService,
+  type BackendScheduleAlternative,
+  type BackendSchedulePayload,
+  type BackendScheduleResponse,
+} from './backend-schedule.service';
+import type * as XLSX from 'xlsx-js-style';
+
+type XlsxModule = typeof import('xlsx-js-style');
 
 export type Category = 'MASTER' | 'SCALED' | 'INTER' | 'RX';
 export type Floor = 'main' | 'secondary';
@@ -38,6 +47,10 @@ export interface Competition {
   wods: Wod[];
   teams: Team[];
   pairedCategories?: CategoryPair | null;
+  optimizedSchedules?: SavedSchedule[];
+  activeScheduleId?: string | null;
+  /** Legacy field migrated by FirebaseService when older data is loaded. */
+  optimizedSchedule?: GeneratedScheduleSnapshot | null;
 }
 
 interface ScheduledWave {
@@ -47,6 +60,7 @@ interface ScheduledWave {
   teams: string[];
   lanes: ScheduledLane[];
   capacity: number;
+  lanePositions?: number[];
 }
 
 interface ScheduledLane {
@@ -63,11 +77,27 @@ interface GeneratedWod {
   waves: ScheduledWave[];
 }
 
-interface GeneratedTrack {
+export interface GeneratedTrack {
   schedule: ScheduleTrack;
   wods: GeneratedWod[];
   groups: GeneratedWodGroup[];
   columns: GeneratedWaveColumn[];
+}
+
+export interface GeneratedScheduleSnapshot {
+  tracks: GeneratedTrack[];
+  algorithmVersion?: number;
+  generatedAt?: string;
+  score?: string;
+  cached?: boolean;
+  minimumRestMinutes?: number;
+  targetPauseLowerMinutes?: number;
+  targetPauseUpperMinutes?: number;
+}
+
+export interface SavedSchedule extends GeneratedScheduleSnapshot {
+  id: string;
+  name: string;
 }
 
 interface GeneratedWaveColumn {
@@ -140,15 +170,30 @@ interface AssignedInterval {
   floor: Floor;
 }
 
+interface WaveAddress {
+  scheduleId: string;
+  workoutId: string;
+  category: Category;
+  waveNumber: number;
+}
+
+interface DraggedTeam {
+  address: WaveAddress;
+  lane: number;
+  teamId: string;
+}
+
 interface DeleteTarget {
-  kind: 'schedule' | 'wod' | 'team' | 'categoryPair';
+  kind: 'schedule' | 'wod' | 'team' | 'teamCategory' | 'generatedSchedule' | 'categoryPair';
   id: string;
   name: string;
+  count?: number;
 }
 
 const CATEGORY_ORDER: Category[] = ['SCALED', 'MASTER', 'INTER', 'RX'];
 const LANE_ORDER = [5, 6, 4, 7, 3, 8, 2, 9, 1, 10];
 const MAX_IDEAL_PAUSE = 120;
+const SCHEDULE_ALGORITHM_VERSION = 5;
 const STORAGE_KEY = 'crossfit-schedule.competitions';
 
 const sampleTeams: Team[] = [
@@ -226,7 +271,7 @@ const sampleCompetition: Competition = {
   templateUrl: './app.html',
   styleUrl: './app.scss',
 })
-export class App {
+export class App implements OnDestroy {
   private readonly firebase = inject(FirebaseService);
   readonly categories: Category[] = ['SCALED', 'MASTER', 'INTER', 'RX'];
   readonly scheduleColumnsPerRow = 7;
@@ -241,6 +286,7 @@ export class App {
   readonly competitionDialogOpen = signal(false);
   readonly editCompetitionDialogOpen = signal(false);
   readonly scheduleFormOpen = signal(false);
+  readonly generatedScheduleFormOpen = signal(false);
   readonly wodFormOpen = signal(false);
   readonly deleteDialogOpen = signal(false);
   readonly deleteTarget = signal<DeleteTarget | null>(null);
@@ -257,10 +303,21 @@ export class App {
   readonly profileMenuOpen = signal(false);
   readonly authMode = signal<'login' | 'register'>('login');
   readonly authBusy = signal(false);
-  readonly generatedSchedule = signal<{ tracks: GeneratedTrack[] }>({ tracks: [] });
+  readonly generatedSchedule = signal<GeneratedScheduleSnapshot>({ tracks: [] });
   readonly scheduleDirty = signal(true);
   readonly optimizationBusy = signal(false);
+  readonly optimizationError = signal('');
+  readonly scheduleEditError = signal('');
+  readonly scheduleExportError = signal('');
+  readonly errorToast = signal('');
+  readonly errorToastDurationMs = 5_000;
+  readonly generationMenuOpen = signal(false);
+  readonly draggedTeam = signal<DraggedTeam | null>(null);
+  readonly draggedOverCell = signal<string | null>(null);
+  readonly exportBusy = signal(false);
   readonly optimizationScenarioCount = 8;
+  private readonly backendSchedule = inject(BackendScheduleService);
+  private errorToastTimer: ReturnType<typeof setTimeout> | null = null;
 
   authUsername = '';
   authPassword = '';
@@ -270,6 +327,16 @@ export class App {
   readonly selectedCompetition = computed(() =>
     this.competitions().find((competition) => competition.id === this.selectedCompetitionId()),
   );
+
+  readonly savedSchedules = computed(() => {
+    const competition = this.selectedCompetition();
+    return competition ? this.validSavedSchedules(competition) : [];
+  });
+
+  readonly activeSavedSchedule = computed(() => {
+    const competition = this.selectedCompetition();
+    return this.savedSchedules().find((schedule) => schedule.id === competition?.activeScheduleId);
+  });
 
   readonly teamScheduleTable = computed<TeamScheduleTable>(() => {
     const competition = this.selectedCompetition();
@@ -311,12 +378,14 @@ export class App {
 
   teamCountDraft = {
     count: 1,
-    category: 'INTER' as Category,
   };
 
   teamBulkCategory: Category = 'INTER';
   teamBulkInput = '';
   teamEditName = '';
+  generatedScheduleNames: string[] = [];
+  generatedScheduleCount = 3;
+  readonly generationCounts = [1, 2, 3] as const;
   categoryPairDraft: CategoryPair = ['SCALED', 'MASTER'];
 
   constructor() {
@@ -333,6 +402,7 @@ export class App {
         this.draftWod.scheduleId = competition.schedules?.[0]?.id ?? '';
         this.draftSchedule.floor = this.hasPrimarySchedule(competition) ? 'secondary' : 'main';
         this.setCategoryPairDraft(competition);
+        this.restoreSavedSchedule(competition);
       }
     });
 
@@ -341,6 +411,15 @@ export class App {
       const competitions = this.competitions();
       if (user && this.dataReady()) void this.firebase.saveCompetitions(competitions);
     });
+  }
+
+  ngOnDestroy(): void {
+    this.clearErrorToastTimer();
+  }
+
+  dismissErrorToast(): void {
+    this.clearErrorToastTimer();
+    this.errorToast.set('');
   }
 
   setAuthMode(mode: 'login' | 'register'): void {
@@ -458,6 +537,25 @@ export class App {
     this.deleteDialogOpen.set(true);
   }
 
+  requestDeleteTeamCategory(category: Category): void {
+    const competition = this.selectedCompetition();
+    const count = competition ? this.teamCount(competition, category) : 0;
+    if (!competition || count === 0) return;
+
+    this.deleteTarget.set({
+      kind: 'teamCategory',
+      id: category,
+      name: this.categoryLabel(category),
+      count,
+    });
+    this.deleteDialogOpen.set(true);
+  }
+
+  requestDeleteGeneratedSchedule(schedule: SavedSchedule): void {
+    this.deleteTarget.set({ kind: 'generatedSchedule', id: schedule.id, name: schedule.name });
+    this.deleteDialogOpen.set(true);
+  }
+
   requestDeleteCategoryPair(pair: CategoryPair): void {
     const competition = this.selectedCompetition();
     if (!competition) return;
@@ -481,6 +579,8 @@ export class App {
     if (target.kind === 'schedule') this.removeSchedule(target.id);
     else if (target.kind === 'wod') this.removeWod(target.id);
     else if (target.kind === 'team') this.removeTeam(target.id);
+    else if (target.kind === 'teamCategory') this.removeTeamsByCategory(target.id as Category);
+    else if (target.kind === 'generatedSchedule') this.removeGeneratedSchedule(target.id);
     else this.clearCategoryPair();
 
     this.closeDeleteDialog();
@@ -536,12 +636,15 @@ export class App {
       wods: [],
       teams: [],
       pairedCategories: null,
+      optimizedSchedules: [],
+      activeScheduleId: null,
     };
 
     this.competitions.update((competitions) => [...competitions, competition]);
     this.selectedCompetitionId.set(competition.id);
     this.generatedSchedule.set({ tracks: [] });
     this.scheduleDirty.set(true);
+    this.optimizationError.set('');
     this.teamSchedule.set(null);
     this.newCompetition = { name: '', date: new Date().toISOString().slice(0, 10) };
     this.competitionDialogOpen.set(false);
@@ -549,13 +652,12 @@ export class App {
 
   selectCompetition(id: string): void {
     this.selectedCompetitionId.set(id);
-    this.generatedSchedule.set({ tracks: [] });
-    this.scheduleDirty.set(true);
     this.teamSchedule.set(null);
     const competition = this.selectedCompetition();
     this.draftWod.scheduleId = competition?.schedules[0]?.id ?? '';
     this.draftSchedule.floor = competition && this.hasPrimarySchedule(competition) ? 'secondary' : 'main';
     this.setCategoryPairDraft(competition);
+    if (competition) this.restoreSavedSchedule(competition);
   }
 
   saveSchedule(): void {
@@ -730,7 +832,7 @@ export class App {
   addTeamsByCount(): void {
     const competition = this.selectedCompetition();
     const count = Math.max(1, Math.floor(Number(this.teamCountDraft.count) || 0));
-    const category = this.teamCountDraft.category;
+    const category = this.activeTeamCategory();
     if (!competition) return;
 
     const startingNumber = competition.teams.filter((team) => team.category === category).length + 1;
@@ -779,6 +881,13 @@ export class App {
     }));
   }
 
+  removeTeamsByCategory(category: Category): void {
+    this.updateCompetition((current) => ({
+      ...current,
+      teams: current.teams.filter((team) => team.category !== category),
+    }));
+  }
+
   saveCategoryPair(): void {
     const competition = this.selectedCompetition();
     const [first, second] = this.categoryPairDraft;
@@ -805,31 +914,771 @@ export class App {
     schedule?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
-  recalculateSchedule(): void {
+  openGeneratedScheduleDialog(count = this.generatedScheduleCount): void {
     const competition = this.selectedCompetition();
     if (!competition || this.optimizationBusy()) return;
 
+    this.generatedScheduleCount = count;
+    this.generationMenuOpen.set(false);
+    this.generatedScheduleNames = this.nextGeneratedScheduleNames(competition, count);
+    this.generatedScheduleFormOpen.set(true);
+  }
+
+  toggleGenerationMenu(): void {
+    if (this.optimizationBusy()) return;
+    this.generationMenuOpen.update((open) => !open);
+  }
+
+  closeGeneratedScheduleDialog(): void {
+    this.generatedScheduleFormOpen.set(false);
+    this.generatedScheduleNames = [];
+  }
+
+  generatedScheduleNamesValid(): boolean {
+    return this.generatedScheduleNames.length === this.generatedScheduleCount
+      && this.generatedScheduleNames.every((name) => name.trim().length > 0);
+  }
+
+  async generateSchedule(): Promise<void> {
+    const competition = this.selectedCompetition();
+    const requestedCount = this.generatedScheduleCount;
+    const names = this.generatedScheduleNames
+      .slice(0, requestedCount)
+      .map((name) => name.trim());
+    if (
+      !competition
+      || names.length !== requestedCount
+      || names.some((name) => !name)
+      || this.optimizationBusy()
+    ) return;
+
+    this.closeGeneratedScheduleDialog();
+    this.dismissErrorToast();
     this.optimizationBusy.set(true);
+    this.optimizationError.set('');
+    this.scheduleEditError.set('');
+    this.scheduleExportError.set('');
     try {
-      let bestSchedule = this.buildSchedule(competition, 0);
-      let bestScore = this.scoreSchedule(competition, bestSchedule);
-
-      for (let scenario = 1; scenario < this.optimizationScenarioCount; scenario += 1) {
-        const candidate = this.buildSchedule(competition, scenario);
-        const score = this.scoreSchedule(competition, candidate);
-        if (this.isBetterScheduleScore(score, bestScore)) {
-          bestSchedule = candidate;
-          bestScore = score;
-        }
+      const response = await this.backendSchedule.optimize(competition, requestedCount);
+      const alternatives: Array<BackendScheduleResponse | BackendScheduleAlternative> = response.alternatives?.length
+        ? response.alternatives
+        : [response];
+      if (alternatives.length < requestedCount) {
+        throw new Error(
+          `Le backend n'a retourné que ${alternatives.length} horaire${alternatives.length === 1 ? '' : 's'} `
+          + `sur les ${requestedCount} demandés. Aucun horaire n'a été sauvegardé.`,
+        );
       }
-
-      this.generatedSchedule.set(bestSchedule);
+      const savedSchedules: SavedSchedule[] = alternatives
+        .slice(0, requestedCount)
+        .map((alternative, index) => ({
+          ...this.mapBackendSchedule(competition, alternative),
+          id: this.makeId('generated-schedule'),
+          name: names[index],
+        }));
+      this.competitions.update((competitions) => competitions.map((candidate) =>
+        candidate.id === competition.id
+          ? {
+              ...candidate,
+              optimizedSchedules: [...(candidate.optimizedSchedules ?? []), ...savedSchedules],
+              activeScheduleId: savedSchedules[0].id,
+              optimizedSchedule: null,
+            }
+          : candidate,
+      ));
+      this.generatedSchedule.set(savedSchedules[0]);
       this.scheduleDirty.set(false);
       this.teamSchedule.set(null);
       this.scrollToSchedule();
+    } catch (error) {
+      this.reportTemporaryError(this.optimizationError, this.optimizationErrorMessage(error));
     } finally {
       this.optimizationBusy.set(false);
     }
+  }
+
+  selectGeneratedSchedule(scheduleId: string): void {
+    const competition = this.selectedCompetition();
+    const saved = competition
+      ? this.validSavedSchedules(competition).find((schedule) => schedule.id === scheduleId)
+      : undefined;
+    if (!competition || !saved) return;
+
+    this.competitions.update((competitions) => competitions.map((candidate) =>
+      candidate.id === competition.id ? { ...candidate, activeScheduleId: saved.id } : candidate,
+    ));
+    this.generatedSchedule.set(saved);
+    this.scheduleDirty.set(false);
+    this.optimizationError.set('');
+    this.scheduleEditError.set('');
+    this.scheduleExportError.set('');
+    this.teamSchedule.set(null);
+  }
+
+  removeGeneratedSchedule(scheduleId: string): void {
+    const competition = this.selectedCompetition();
+    if (!competition) return;
+
+    const remaining = (competition.optimizedSchedules ?? []).filter((schedule) => schedule.id !== scheduleId);
+    const validRemaining = this.validSavedSchedules({ ...competition, optimizedSchedules: remaining });
+    const next = validRemaining.find((schedule) => schedule.id === competition.activeScheduleId) ?? validRemaining[0];
+
+    this.competitions.update((competitions) => competitions.map((candidate) =>
+      candidate.id === competition.id
+        ? { ...candidate, optimizedSchedules: remaining, activeScheduleId: next?.id ?? null, optimizedSchedule: null }
+        : candidate,
+    ));
+    this.generatedSchedule.set(next ?? { tracks: [] });
+    this.scheduleDirty.set(!next);
+    this.optimizationError.set('');
+    this.scheduleEditError.set('');
+    this.scheduleExportError.set('');
+    this.teamSchedule.set(null);
+  }
+
+  async exportScheduleToExcel(): Promise<void> {
+    const competition = this.selectedCompetition();
+    const saved = this.activeSavedSchedule();
+    if (!competition || !saved || saved.tracks.length === 0) return;
+
+    this.dismissErrorToast();
+    this.scheduleExportError.set('');
+    this.exportBusy.set(true);
+    try {
+      const xlsx = await import('xlsx-js-style');
+      const workbook = xlsx.utils.book_new();
+      xlsx.utils.book_append_sheet(workbook, this.buildExcelSummarySheet(xlsx, competition, saved), 'Résumé');
+
+      const usedSheetNames = new Set(['Résumé']);
+      saved.tracks.forEach((track, index) => {
+        const sheetName = this.excelFloorSheetName(track, index, usedSheetNames);
+        usedSheetNames.add(sheetName);
+        xlsx.utils.book_append_sheet(workbook, this.buildExcelFloorSheet(xlsx, competition, saved, track), sheetName);
+      });
+
+      const filename = `${this.excelSafeName(competition.name)}-${this.excelSafeName(saved.name)}-${competition.date}.xlsx`;
+      xlsx.writeFile(workbook, filename, { bookType: 'xlsx', cellStyles: true });
+    } catch {
+      this.reportTemporaryError(this.scheduleExportError, 'Impossible de créer le fichier Excel.');
+    } finally {
+      this.exportBusy.set(false);
+    }
+  }
+
+  private buildExcelSummarySheet(xlsx: XlsxModule, competition: Competition, saved: SavedSchedule): XLSX.WorkSheet {
+    const titleStyle = this.excelStyle({ fill: '2F3C34', fontColor: 'FFFFFF', fontSize: 14, bold: true });
+    const labelStyle = this.excelStyle({ fill: 'F0F4ED', fontColor: '526258', bold: true, horizontal: 'left' });
+    const valueStyle = this.excelStyle({ fill: 'FFFFFF', fontColor: '34443A', horizontal: 'left' });
+    const rows: XLSX.CellObject[][] = [
+      [this.excelCell('Résumé de l’horaire', titleStyle), this.excelBlank(titleStyle)],
+      [this.excelCell('Compétition', labelStyle), this.excelCell(competition.name, valueStyle)],
+      [this.excelCell('Date', labelStyle), this.excelCell(this.formatDate(competition.date), valueStyle)],
+      [this.excelCell('Horaire actif', labelStyle), this.excelCell(saved.name, valueStyle)],
+      [this.excelCell('Généré le', labelStyle), this.excelCell(saved.generatedAt ? this.formatSavedAt(saved.generatedAt) : '', valueStyle)],
+      [this.excelCell('Score Timefold', labelStyle), this.excelCell(saved.score ?? '', valueStyle)],
+      [this.excelCell('Équipes', labelStyle), this.excelCell(competition.teams.length, valueStyle)],
+      [this.excelCell('WODs', labelStyle), this.excelCell(competition.wods.length, valueStyle)],
+      [this.excelCell('Pause minimale floor 2 (min)', labelStyle), this.excelCell(saved.minimumRestMinutes ?? 60, valueStyle)],
+      [this.excelCell('Feuilles détaillées', labelStyle), this.excelCell('Une feuille par floor, organisée comme l’affichage « Par floor ».', valueStyle)],
+    ];
+    const worksheet = this.excelWorksheetFromRows(xlsx, rows, [24, 58], [{ hpt: 24 }, ...Array.from({ length: rows.length - 1 }, () => ({ hpt: 20 }))]);
+    worksheet['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 1 } }];
+    return worksheet;
+  }
+
+  private buildExcelFloorSheet(
+    _xlsx: XlsxModule,
+    competition: Competition,
+    _saved: SavedSchedule,
+    track: GeneratedTrack,
+  ): XLSX.WorkSheet {
+    const groups = track.groups.length ? track.groups : this.groupGeneratedWods(track.wods);
+    const chunks = groups.flatMap((group) => this.scheduleRows(group.columns));
+    const maxWaveCount = Math.max(1, ...chunks.map((columns) => columns.length));
+    const maxColumns = maxWaveCount * 2;
+    const rows: XLSX.CellObject[][] = [];
+    const rowHeights: XLSX.RowInfo[] = [];
+    const merges: XLSX.Range[] = [];
+    const blankStyle = this.excelStyle({ fill: 'FFFFFF', borderColor: 'FFFFFF' });
+    const floorTitleStyle = this.excelStyle({ fill: '2F3C34', fontColor: 'FFFFFF', fontSize: 14, bold: true });
+    const floorMetaStyle = this.excelStyle({ fill: 'EDF5E9', fontColor: '526258', fontSize: 10, bold: true });
+    const wodTitleStyle = this.excelStyle({ fill: 'FFFFFF', fontColor: '1E2922', fontSize: 11, bold: true });
+    const waveHeaderStyle = this.excelStyle({ fill: 'FFFFFF', fontColor: '1E2922', fontSize: 9, bold: true });
+
+    const addRow = (cells: XLSX.CellObject[], height: number): number => {
+      const rowIndex = rows.length;
+      rows.push(this.padExcelRow(cells, maxColumns, blankStyle));
+      rowHeights.push({ hpt: height });
+      return rowIndex;
+    };
+    const mergeBlock = (row: number, width: number): void => {
+      merges.push({ s: { r: row, c: 0 }, e: { r: row, c: Math.max(0, width - 1) } });
+    };
+
+    const floorTitleRow = addRow([
+      this.excelCell(`${this.floorLabel(track.schedule.floor)} · ${track.schedule.name}`, floorTitleStyle),
+      ...Array.from({ length: maxColumns - 1 }, () => this.excelBlank(floorTitleStyle)),
+    ], 27);
+    mergeBlock(floorTitleRow, maxColumns);
+    const metaRow = addRow([
+      this.excelCell(`${competition.name} · ${this.formatDate(competition.date)} · Début ${track.schedule.startTime}`, floorMetaStyle),
+      ...Array.from({ length: maxColumns - 1 }, () => this.excelBlank(floorMetaStyle)),
+    ], 22);
+    mergeBlock(metaRow, maxColumns);
+    addRow(Array.from({ length: maxColumns }, () => this.excelBlank(blankStyle)), 7);
+
+    if (groups.length === 0) {
+      const emptyStyle = this.excelStyle({ fill: 'FFFFFF', fontColor: '89948C', fontSize: 10 });
+      const emptyRow = addRow([
+        this.excelCell('Aucun WOD dans cet horaire.', emptyStyle),
+        ...Array.from({ length: maxColumns - 1 }, () => this.excelBlank(emptyStyle)),
+      ], 24);
+      mergeBlock(emptyRow, maxColumns);
+    }
+
+    groups.forEach((group) => {
+      this.scheduleRows(group.columns).forEach((columns, chunkIndex) => {
+        const blockWidth = columns.length * 2;
+        if (chunkIndex === 0) {
+          const wodTitleRow = addRow([
+            this.excelCell(group.wod.name, wodTitleStyle),
+            ...Array.from({ length: blockWidth - 1 }, () => this.excelBlank(wodTitleStyle)),
+          ], 23);
+          mergeBlock(wodTitleRow, blockWidth);
+        }
+
+        const categoryCells: XLSX.CellObject[] = [];
+        const categoryRowGroups = this.categoryGroupsForColumns(group, columns);
+        let categoryOffset = 0;
+        categoryRowGroups.forEach((categoryGroup) => {
+          const categoryWidth = categoryGroup.columns.length * 2;
+          const style = this.excelStyle({
+            fill: categoryGroup.categories.length > 1 ? 'F4F0D8' : this.excelCategoryFill(categoryGroup.category),
+            fontColor: '1E2922',
+            fontSize: 9,
+            bold: true,
+          });
+          categoryCells.push(this.excelCell(this.categoryLabels(categoryGroup.categories), style));
+          categoryCells.push(...Array.from({ length: categoryWidth - 1 }, () => this.excelBlank(style)));
+          const categoryRow = rows.length;
+          merges.push({ s: { r: categoryRow, c: categoryOffset }, e: { r: categoryRow, c: categoryOffset + categoryWidth - 1 } });
+          categoryOffset += categoryWidth;
+        });
+        while (categoryOffset < blockWidth) {
+          categoryCells.push(this.excelBlank(blankStyle));
+          categoryOffset += 1;
+        }
+        addRow(categoryCells, 22);
+
+        const waveCells: XLSX.CellObject[] = [];
+        columns.forEach((column) => {
+          waveCells.push(this.excelCell(`Wave ${column.wave.number}\n${this.formatTimeRange(column.wave.start, column.wave.end)}`, waveHeaderStyle));
+          waveCells.push(this.excelBlank(waveHeaderStyle));
+          const waveHeaderRow = rows.length;
+          const waveOffset = waveCells.length - 2;
+          merges.push({ s: { r: waveHeaderRow, c: waveOffset }, e: { r: waveHeaderRow, c: waveOffset + 1 } });
+        });
+        addRow(waveCells, 30);
+
+        for (const laneNumber of this.laneNumbersForWave(columns[0], track.schedule.floor)) {
+          const laneCells: XLSX.CellObject[] = [];
+          columns.forEach((column) => {
+            const assignedLane = column.wave.lanes.find((lane) => lane.lane === laneNumber);
+            const team = assignedLane ? competition.teams.find((candidate) => candidate.id === assignedLane.teamId) : undefined;
+            const fill = team
+              ? this.excelCategoryFill(team.category)
+              : column.generatedWod.categories.length > 1
+                ? 'F4F0D8'
+                : this.excelCategoryFill(column.generatedWod.category);
+            const laneStyle = this.excelStyle({ fill, fontColor: '829085', fontSize: 8 });
+            const teamStyle = this.excelStyle({ fill, fontColor: '36453B', fontSize: 9, italic: !team });
+            laneCells.push(this.excelCell(laneNumber, laneStyle));
+            laneCells.push(this.excelCell(team?.name ?? '', teamStyle));
+          });
+          addRow(laneCells, 20);
+        }
+        addRow(Array.from({ length: maxColumns }, () => this.excelBlank(blankStyle)), 7);
+      });
+    });
+
+    const worksheet = this.excelWorksheetFromRows(
+      _xlsx,
+      rows,
+      Array.from({ length: maxColumns }, (_, index) => index % 2 === 0 ? 5 : 25),
+      rowHeights,
+    );
+    worksheet['!merges'] = merges;
+    return worksheet;
+  }
+
+  private excelFloorSheetName(track: GeneratedTrack, index: number, usedNames: Set<string>): string {
+    const base = this.floorLabel(track.schedule.floor);
+    let name = base.slice(0, 31);
+    let suffix = 2;
+    while (usedNames.has(name)) {
+      const suffixText = ` ${suffix}`;
+      name = `${base.slice(0, 31 - suffixText.length)}${suffixText}`;
+      suffix += 1;
+    }
+    return name || `Floor ${index + 1}`;
+  }
+
+  private excelWorksheetFromRows(
+    xlsx: XlsxModule,
+    rows: XLSX.CellObject[][],
+    columnWidths: number[],
+    rowHeights: XLSX.RowInfo[],
+  ): XLSX.WorkSheet {
+    const worksheet = xlsx.utils.aoa_to_sheet(rows);
+    worksheet['!cols'] = columnWidths.map((wch) => ({ wch }));
+    worksheet['!rows'] = rowHeights;
+    return worksheet;
+  }
+
+  private padExcelRow(row: XLSX.CellObject[], width: number, blankStyle: XLSX.CellStyle): XLSX.CellObject[] {
+    return [
+      ...row,
+      ...Array.from({ length: Math.max(0, width - row.length) }, () => this.excelBlank(blankStyle)),
+    ];
+  }
+
+  private excelCell(value: string | number, style: XLSX.CellStyle): XLSX.CellObject {
+    return { v: value, t: typeof value === 'number' ? 'n' : 's', s: style };
+  }
+
+  private excelBlank(style: XLSX.CellStyle): XLSX.CellObject {
+    return this.excelCell('', style);
+  }
+
+  private excelStyle(options: {
+    fill?: string;
+    fontColor?: string;
+    fontSize?: number;
+    bold?: boolean;
+    italic?: boolean;
+    horizontal?: 'left' | 'center' | 'right';
+    borderColor?: string;
+  }): XLSX.CellStyle {
+    const borderColor = { rgb: options.borderColor ?? '222222' };
+    const edge = { style: 'thin' as const, color: borderColor };
+    return {
+      fill: { patternType: 'solid', fgColor: { rgb: options.fill ?? 'FFFFFF' } },
+      font: {
+        name: 'Calibri',
+        sz: options.fontSize ?? 9,
+        color: { rgb: options.fontColor ?? '1E2922' },
+        ...(options.bold ? { bold: true } : {}),
+        ...(options.italic ? { italic: true } : {}),
+      },
+      alignment: {
+        horizontal: options.horizontal ?? 'center',
+        vertical: 'center',
+        wrapText: true,
+      },
+      border: { top: edge, right: edge, bottom: edge, left: edge },
+    };
+  }
+
+  private excelCategoryFill(category: Category): string {
+    return {
+      SCALED: 'E0EFD7',
+      MASTER: 'E0E4F4',
+      INTER: 'F9EFC7',
+      RX: 'F8DFD3',
+    }[category];
+  }
+
+  private excelSafeName(value: string): string {
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase() || 'horaire';
+  }
+
+  startTeamDrag(
+    event: DragEvent,
+    track: GeneratedTrack,
+    column: GeneratedWaveColumn,
+    lane: number,
+    teamId: string,
+  ): void {
+    if (!this.activeSavedSchedule() || this.optimizationBusy()) {
+      event.preventDefault();
+      return;
+    }
+
+    this.dismissErrorToast();
+    this.scheduleEditError.set('');
+    this.draggedOverCell.set(null);
+    this.draggedTeam.set({
+      address: this.waveAddress(track.schedule.id, column),
+      lane,
+      teamId,
+    });
+    event.dataTransfer?.setData('text/plain', teamId);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+  }
+
+  endTeamDrag(): void {
+    this.draggedTeam.set(null);
+    this.draggedOverCell.set(null);
+  }
+
+  allowTeamDrop(event: DragEvent, track: GeneratedTrack, column: GeneratedWaveColumn, lane: number): void {
+    if (!this.draggedTeam()) return;
+    event.preventDefault();
+    this.draggedOverCell.set(this.waveCellKey(this.waveAddress(track.schedule.id, column), lane));
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  }
+
+  isDragTarget(track: GeneratedTrack, column: GeneratedWaveColumn, lane: number): boolean {
+    const dragged = this.draggedTeam();
+    if (!dragged) return false;
+    return this.draggedOverCell() === this.waveCellKey(this.waveAddress(track.schedule.id, column), lane)
+      && !this.sameWaveCell(dragged.address, dragged.lane, this.waveAddress(track.schedule.id, column), lane);
+  }
+
+  isDraggedSource(track: GeneratedTrack, column: GeneratedWaveColumn, lane: number): boolean {
+    const dragged = this.draggedTeam();
+    if (!dragged) return false;
+    return this.sameWaveCell(
+      dragged.address,
+      dragged.lane,
+      this.waveAddress(track.schedule.id, column),
+      lane,
+    );
+  }
+
+  dropTeam(event: DragEvent, track: GeneratedTrack, column: GeneratedWaveColumn, lane: number): void {
+    event.preventDefault();
+    const dragged = this.draggedTeam();
+    this.draggedTeam.set(null);
+    this.draggedOverCell.set(null);
+    if (!dragged) return;
+
+    const targetAddress = this.waveAddress(track.schedule.id, column);
+    if (this.sameWaveCell(dragged.address, dragged.lane, targetAddress, lane)) return;
+
+    const competition = this.selectedCompetition();
+    const current = this.generatedSchedule();
+    if (!competition) return;
+
+    const candidateTracks = this.cloneGeneratedTracks(current.tracks);
+    const sourceLocation = this.findWaveLocation(candidateTracks, dragged.address);
+    const targetLocation = this.findWaveLocation(candidateTracks, targetAddress);
+    if (!sourceLocation || !targetLocation) {
+      this.reportTemporaryError(
+        this.scheduleEditError,
+        'Déplacement impossible : la vague n’est plus disponible.',
+      );
+      return;
+    }
+
+    const sourceWave = candidateTracks[sourceLocation.trackIndex].wods[sourceLocation.generatedWodIndex].waves[sourceLocation.waveIndex];
+    const targetWave = candidateTracks[targetLocation.trackIndex].wods[targetLocation.generatedWodIndex].waves[targetLocation.waveIndex];
+    const sourceTeam = sourceWave.lanes.find((candidate) => candidate.lane === dragged.lane)?.teamId;
+    const targetTeam = targetWave.lanes.find((candidate) => candidate.lane === lane)?.teamId ?? null;
+    if (sourceTeam !== dragged.teamId) {
+      this.reportTemporaryError(
+        this.scheduleEditError,
+        'Déplacement impossible : l’équipe source n’est plus à cette position.',
+      );
+      return;
+    }
+
+    this.setLaneTeam(sourceWave, dragged.lane, targetTeam);
+    this.setLaneTeam(targetWave, lane, sourceTeam);
+
+    const minimumRestMinutes = Math.max(60, current.minimumRestMinutes ?? 60);
+    const validationError = this.validateManualSchedule(candidateTracks, competition, minimumRestMinutes);
+    if (validationError) {
+      this.reportTemporaryError(this.scheduleEditError, validationError);
+      return;
+    }
+
+    this.persistManualSchedule(candidateTracks);
+  }
+
+  private persistManualSchedule(tracks: GeneratedTrack[]): void {
+    const competition = this.selectedCompetition();
+    const activeId = competition?.activeScheduleId;
+    const saved = activeId
+      ? this.validSavedSchedules(competition).find((schedule) => schedule.id === activeId)
+      : undefined;
+    if (!competition || !saved) {
+      this.reportTemporaryError(
+        this.scheduleEditError,
+        'Enregistrez d’abord l’horaire généré avant de le modifier.',
+      );
+      return;
+    }
+
+    const updated: SavedSchedule = {
+      ...this.generatedSchedule(),
+      id: saved.id,
+      name: saved.name,
+      tracks,
+    };
+    this.generatedSchedule.set(updated);
+    this.competitions.update((competitions) => competitions.map((candidate) =>
+      candidate.id === competition.id
+        ? {
+            ...candidate,
+            activeScheduleId: saved.id,
+            optimizedSchedules: (candidate.optimizedSchedules ?? []).map((schedule) =>
+              schedule.id === saved.id ? updated : schedule,
+            ),
+            optimizedSchedule: null,
+          }
+        : candidate,
+    ));
+    this.scheduleDirty.set(false);
+    this.scheduleEditError.set('');
+    this.teamSchedule.set(null);
+  }
+
+  private validateManualSchedule(tracks: GeneratedTrack[], competition: Competition, minimumRestMinutes: number): string | null {
+    const intervalsByTeam = new Map<string, Array<{ start: number; end: number; floor: Floor }>>();
+
+    for (const track of tracks) {
+      for (const generatedWod of track.wods) {
+        for (const wave of generatedWod.waves) {
+          for (const lane of wave.lanes) {
+            const intervals = intervalsByTeam.get(lane.teamId) ?? [];
+            intervals.push({ start: wave.start, end: wave.end, floor: track.schedule.floor });
+            intervalsByTeam.set(lane.teamId, intervals);
+          }
+        }
+      }
+    }
+
+    for (const [teamId, teamIntervals] of intervalsByTeam) {
+      const teamName = competition.teams.find((team) => team.id === teamId)?.name ?? teamId;
+      const intervals = [...teamIntervals].sort((first, second) => first.start - second.start);
+      for (let index = 0; index < intervals.length - 1; index += 1) {
+        const first = intervals[index];
+        const second = intervals[index + 1];
+        const rest = second.start - first.end;
+        if ((first.floor === 'secondary' || second.floor === 'secondary') && rest < minimumRestMinutes) {
+          return `Déplacement refusé : ${teamName} doit garder au moins ${minimumRestMinutes} minutes autour d’un WOD du floor 2.`;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private waveAddress(scheduleId: string, column: GeneratedWaveColumn): WaveAddress {
+    return {
+      scheduleId,
+      workoutId: column.generatedWod.wod.id,
+      category: column.generatedWod.category,
+      waveNumber: column.wave.number,
+    };
+  }
+
+  private sameWaveCell(first: WaveAddress, firstLane: number, second: WaveAddress, secondLane: number): boolean {
+    return first.scheduleId === second.scheduleId
+      && first.workoutId === second.workoutId
+      && first.category === second.category
+      && first.waveNumber === second.waveNumber
+      && firstLane === secondLane;
+  }
+
+  private waveCellKey(address: WaveAddress, lane: number): string {
+    return `${address.scheduleId}|${address.workoutId}|${address.category}|${address.waveNumber}|${lane}`;
+  }
+
+  private cloneGeneratedTracks(tracks: GeneratedTrack[]): GeneratedTrack[] {
+    return tracks.map((track) => {
+      const wods = track.wods.map((generatedWod) => ({
+        ...generatedWod,
+        waves: generatedWod.waves.map((wave) => ({
+          ...wave,
+          teams: [...wave.teams],
+          lanes: wave.lanes.map((lane) => ({ ...lane })),
+          lanePositions: wave.lanePositions ? [...wave.lanePositions] : undefined,
+        })),
+      }));
+      const groups = this.groupGeneratedWods(wods);
+      return { ...track, wods, groups, columns: groups.flatMap((group) => group.columns) };
+    });
+  }
+
+  private findWaveLocation(
+    tracks: GeneratedTrack[],
+    address: WaveAddress,
+  ): { trackIndex: number; generatedWodIndex: number; waveIndex: number } | null {
+    const trackIndex = tracks.findIndex((track) => track.schedule.id === address.scheduleId);
+    if (trackIndex < 0) return null;
+    const generatedWodIndex = tracks[trackIndex].wods.findIndex((generatedWod) =>
+      generatedWod.wod.id === address.workoutId && generatedWod.category === address.category,
+    );
+    if (generatedWodIndex < 0) return null;
+    const waveIndex = tracks[trackIndex].wods[generatedWodIndex].waves.findIndex((wave) => wave.number === address.waveNumber);
+    return waveIndex < 0 ? null : { trackIndex, generatedWodIndex, waveIndex };
+  }
+
+  private setLaneTeam(wave: ScheduledWave, laneNumber: number, teamId: string | null): void {
+    const laneIndex = wave.lanes.findIndex((lane) => lane.lane === laneNumber);
+    if (teamId === null) {
+      if (laneIndex >= 0) wave.lanes.splice(laneIndex, 1);
+    } else if (laneIndex >= 0) {
+      wave.lanes[laneIndex] = { lane: laneNumber, teamId };
+    } else {
+      wave.lanes.push({ lane: laneNumber, teamId });
+    }
+    wave.lanes.sort((first, second) => first.lane - second.lane);
+    wave.teams = wave.lanes.map((lane) => lane.teamId);
+  }
+
+  formatSavedAt(value?: string): string {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return new Intl.DateTimeFormat('fr-CA', {
+      day: 'numeric',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(date);
+  }
+
+  private restoreSavedSchedule(competition: Competition): void {
+    const schedules = this.validSavedSchedules(competition);
+    const saved = schedules.find((schedule) => schedule.id === competition.activeScheduleId) ?? schedules[0] ?? null;
+    if (saved && competition.activeScheduleId !== saved.id) {
+      this.competitions.update((competitions) => competitions.map((candidate) =>
+        candidate.id === competition.id ? { ...candidate, activeScheduleId: saved.id } : candidate,
+      ));
+    }
+    this.generatedSchedule.set(saved ?? { tracks: [] });
+    this.scheduleDirty.set(!saved);
+    this.optimizationError.set('');
+    this.scheduleEditError.set('');
+    this.scheduleExportError.set('');
+  }
+
+  private validSavedSchedules(competition: Competition): SavedSchedule[] {
+    return (competition.optimizedSchedules ?? [])
+      .filter((schedule): schedule is SavedSchedule =>
+        Boolean(schedule)
+        && typeof schedule.id === 'string'
+        && typeof schedule.name === 'string'
+        && schedule.algorithmVersion === SCHEDULE_ALGORITHM_VERSION,
+      );
+  }
+
+  private nextGeneratedScheduleNames(competition: Competition, count: number): string[] {
+    const firstNumber = this.validSavedSchedules(competition).length + 1;
+    return Array.from({ length: count }, (_, index) => `Horaire ${firstNumber + index}`);
+  }
+
+  private mapBackendSchedule(
+    competition: Competition,
+    response: BackendSchedulePayload | BackendScheduleResponse,
+  ): GeneratedScheduleSnapshot {
+    const tracks = competition.schedules.map((schedule) => {
+      const generatedWods = competition.wods
+        .filter((wod) => wod.scheduleId === schedule.id)
+        .flatMap((wod) => {
+          const assignments = response.assignments.filter((assignment) =>
+            assignment.workout.id === wod.id && assignment.timeSlot.scheduleId === schedule.id,
+          );
+          const byCategoryGroup = new Map<number, typeof assignments>();
+          assignments.forEach((assignment) => {
+            const group = byCategoryGroup.get(assignment.timeSlot.categoryGroupIndex) ?? [];
+            group.push(assignment);
+            byCategoryGroup.set(assignment.timeSlot.categoryGroupIndex, group);
+          });
+
+          return [...byCategoryGroup.entries()]
+            .sort(([first], [second]) => first - second)
+            .map(([, groupAssignments]) => {
+              const bySlot = new Map<string, typeof groupAssignments>();
+              groupAssignments.forEach((assignment) => {
+                const slot = bySlot.get(assignment.timeSlot.id) ?? [];
+                slot.push(assignment);
+                bySlot.set(assignment.timeSlot.id, slot);
+              });
+              const waves = [...bySlot.values()]
+                .sort((first, second) => first[0].timeSlot.waveNumber - second[0].timeSlot.waveNumber)
+                .map((slotAssignments) => {
+                  const first = slotAssignments[0].timeSlot;
+                  const lanes = slotAssignments
+                    .map((assignment) => ({ lane: assignment.lane, teamId: assignment.team.id }))
+                    .sort((firstLane, secondLane) => firstLane.lane - secondLane.lane);
+                  return {
+                    number: first.waveNumber,
+                    start: this.isoTimeToMinutes(first.start),
+                    end: this.isoTimeToMinutes(first.end),
+                    teams: lanes.map((lane) => lane.teamId),
+                    lanes,
+                    capacity: first.laneCount,
+                    lanePositions: first.lanePositions,
+                  };
+                });
+              const categories = groupAssignments[0]?.timeSlot.allowedCategories as Category[] ?? [];
+              return {
+                wod,
+                category: categories[0] ?? 'SCALED',
+                categories,
+                start: Math.min(...waves.map((wave) => wave.start)),
+                end: Math.max(...waves.map((wave) => wave.end)),
+                waves,
+              };
+            });
+        });
+      const groups = this.groupGeneratedWods(generatedWods);
+      return { schedule, wods: generatedWods, groups, columns: groups.flatMap((group) => group.columns) };
+    });
+
+    return {
+      tracks,
+      algorithmVersion: SCHEDULE_ALGORITHM_VERSION,
+      generatedAt: response.generatedAt,
+      score: response.score,
+      cached: 'cached' in response ? response.cached : false,
+      minimumRestMinutes: response.summary.minimumRestMinutes,
+      targetPauseLowerMinutes: response.summary.targetPauseLowerMinutes,
+      targetPauseUpperMinutes: response.summary.targetPauseUpperMinutes,
+    };
+  }
+
+  private isoTimeToMinutes(value: string): number {
+    const match = value.match(/T(\d{2}):(\d{2})/);
+    return match ? Number(match[1]) * 60 + Number(match[2]) : 0;
+  }
+
+  private optimizationErrorMessage(error: unknown): string {
+    const response = error as {
+      error?: { message?: string; details?: string[] };
+      message?: string;
+    };
+    const payload = response.error;
+    if (payload?.message) {
+      const details = payload.details?.filter(Boolean).join(' ');
+      return details ? `${payload.message} ${details}` : payload.message;
+    }
+    return response.message ?? 'Impossible de joindre le backend local. Vérifiez qu’il écoute sur le port 8080.';
+  }
+
+  private reportTemporaryError(target: WritableSignal<string>, message: string): void {
+    target.set(message);
+    this.clearErrorToastTimer();
+    this.errorToast.set(message);
+    this.errorToastTimer = setTimeout(() => {
+      this.errorToast.set('');
+      this.errorToastTimer = null;
+    }, this.errorToastDurationMs);
+  }
+
+  private clearErrorToastTimer(): void {
+    if (this.errorToastTimer === null) return;
+    clearTimeout(this.errorToastTimer);
+    this.errorToastTimer = null;
   }
 
   categoryLabel(category: Category): string {
@@ -896,14 +1745,24 @@ export class App {
     this.teamSchedule.set(null);
   }
 
-  laneNumbersForWave(column: GeneratedWaveColumn): number[] {
-    const configuredCapacity = Math.min(10, Math.max(1, Math.floor(Number(column.generatedWod.wod.teamsPerWave) || 1)));
-    return Array.from({ length: configuredCapacity }, (_, index) => index + 1);
+  laneNumbersForWave(column: GeneratedWaveColumn, floor?: Floor): number[] {
+    const configuredCapacity = Math.max(
+      1,
+      Math.min(LANE_ORDER.length, Math.floor(Number(column.generatedWod.wod.teamsPerWave) || 1)),
+    );
+    const configuredFloor = floor
+      ?? this.selectedCompetition()?.schedules.find(
+        (schedule) => schedule.id === column.generatedWod.wod.scheduleId,
+      )?.floor;
+    const lanePositions = configuredFloor === 'main'
+      ? LANE_ORDER.slice(0, configuredCapacity)
+      : Array.from({ length: configuredCapacity }, (_, index) => index + 1);
+    return lanePositions.sort((first, second) => first - second);
   }
 
-  private laneForWod(wod: Wod, index: number): number {
-    const configuredCapacity = Math.min(10, Math.max(1, Math.floor(Number(wod.teamsPerWave) || 1)));
-    return configuredCapacity < LANE_ORDER.length ? index + 1 : LANE_ORDER[index] ?? index + 1;
+  private laneForWod(_wod: Wod, index: number, floor: Floor = 'main'): number {
+    if (floor === 'main') return LANE_ORDER[index] ?? index + 1;
+    return index + 1;
   }
 
   formatPause(minutes: number): string {
@@ -912,20 +1771,56 @@ export class App {
   }
 
   scheduleRows(columns: GeneratedWaveColumn[]): GeneratedWaveColumn[][] {
+    const chronologicalColumns = [...columns].sort((first, second) =>
+      first.wave.start - second.wave.start
+      || first.wave.end - second.wave.end
+      || first.generatedWod.wod.id.localeCompare(second.generatedWod.wod.id)
+      || first.wave.number - second.wave.number);
     const rows: GeneratedWaveColumn[][] = [];
-    for (let index = 0; index < columns.length; index += this.scheduleColumnsPerRow) {
-      rows.push(columns.slice(index, index + this.scheduleColumnsPerRow));
+    for (let index = 0; index < chronologicalColumns.length; index += this.scheduleColumnsPerRow) {
+      rows.push(chronologicalColumns.slice(index, index + this.scheduleColumnsPerRow));
     }
     return rows;
   }
 
   categoryGroupsForColumns(group: GeneratedWodGroup, columns: GeneratedWaveColumn[]): GeneratedCategoryGroup[] {
-    return group.categories
-      .map((categoryGroup) => ({
-        ...categoryGroup,
-        columns: categoryGroup.columns.filter((column) => columns.includes(column)),
-      }))
-      .filter((categoryGroup) => categoryGroup.columns.length > 0);
+    const categoryByColumnKey = new Map<string, GeneratedCategoryGroup>();
+    group.categories.forEach((categoryGroup) =>
+      categoryGroup.columns.forEach((column) =>
+        categoryByColumnKey.set(this.generatedWaveColumnKey(column), categoryGroup)));
+
+    const contiguousGroups: Array<{
+      source: GeneratedCategoryGroup;
+      value: GeneratedCategoryGroup;
+    }> = [];
+    columns.forEach((column) => {
+      const source = categoryByColumnKey.get(this.generatedWaveColumnKey(column)) ?? {
+        category: column.generatedWod.category,
+        categories: column.generatedWod.categories,
+        columns: [column],
+      };
+      const previous = contiguousGroups.at(-1);
+      if (previous?.source === source) {
+        previous.value.columns.push(column);
+        return;
+      }
+      contiguousGroups.push({
+        source,
+        value: { ...source, columns: [column] },
+      });
+    });
+
+    return contiguousGroups.map((entry) => entry.value);
+  }
+
+  private generatedWaveColumnKey(column: GeneratedWaveColumn): string {
+    return [
+      column.generatedWod.wod.id,
+      ...column.generatedWod.categories,
+      column.wave.number,
+      column.wave.start,
+      column.wave.end,
+    ].join('|');
   }
 
   private entriesForTeam(
@@ -935,7 +1830,7 @@ export class App {
   ): TeamScheduleEntry[] {
     const entries = tracks.flatMap((track) => track.wods.flatMap((generatedWod) =>
       generatedWod.waves
-        .filter((wave) => wave.teams.includes(teamId))
+        .filter((wave) => wave.lanes.some((lane) => lane.teamId === teamId))
         .map((wave) => ({
           columnId: columnIds?.get(generatedWod) ?? generatedWod.wod.id,
           wod: generatedWod.wod,
@@ -1011,12 +1906,12 @@ export class App {
   } {
     const generatedWods = tracks
       .flatMap((track, trackIndex) => track.wods
-        .filter((generatedWod) => generatedWod.waves.some((wave) => wave.teams.length > 0))
+        .filter((generatedWod) => generatedWod.waves.some((wave) => wave.lanes.length > 0))
         .map((generatedWod) => ({
           track,
           trackIndex,
           generatedWod,
-          start: Math.min(...generatedWod.waves.filter((wave) => wave.teams.length > 0).map((wave) => wave.start)),
+          start: Math.min(...generatedWod.waves.filter((wave) => wave.lanes.length > 0).map((wave) => wave.start)),
         })))
       .sort((first, second) =>
         first.start - second.start
@@ -1027,7 +1922,6 @@ export class App {
     const columnIds = new Map<GeneratedWod, string>();
     const mainColumns: TeamScheduleColumn[] = [];
     const mainColumnByWod = new Map<string, TeamScheduleColumn>();
-    const mainCategoryStarts = new Map<string, Map<Category, number>>();
 
     generatedWods
       .filter(({ track }) => track.schedule.floor === 'main')
@@ -1046,53 +1940,52 @@ export class App {
           mainColumns.push(column);
         }
 
-        const categoryStarts = mainCategoryStarts.get(generatedWod.wod.id) ?? new Map<Category, number>();
-        generatedWod.categories.forEach((category) => {
-          categoryStarts.set(category, Math.min(categoryStarts.get(category) ?? Number.POSITIVE_INFINITY, start));
-        });
-        mainCategoryStarts.set(generatedWod.wod.id, categoryStarts);
         columnIds.set(generatedWod, column.id);
       });
 
+    const assignedTeamIds = new Set(
+      tracks.flatMap((track) => track.wods.flatMap((generatedWod) =>
+        generatedWod.waves.flatMap((wave) => wave.lanes.map((lane) => lane.teamId)),
+      )),
+    );
+    const secondaryColumnByKey = new Map<string, TeamScheduleColumn>();
+    assignedTeamIds.forEach((teamId) => {
+      const entries = this.entriesForTeam(tracks, teamId);
+      const mainEntries = entries.filter((entry) => entry.schedule.floor === 'main');
+      entries
+        .filter((entry) => entry.schedule.floor === 'secondary')
+        .forEach((entry) => {
+          const secondarySlot = mainEntries.filter((mainEntry) => mainEntry.start < entry.start).length;
+          const key = `${entry.wod.id}|${secondarySlot}`;
+          const existing = secondaryColumnByKey.get(key);
+          if (existing) {
+            existing.start = Math.min(existing.start, entry.start);
+            return;
+          }
+          secondaryColumnByKey.set(key, {
+            id: `${entry.wod.id}-secondary-slot-${secondarySlot}`,
+            wodId: entry.wod.id,
+            name: entry.wod.name,
+            schedule: entry.schedule,
+            start: entry.start,
+            secondarySlot,
+          });
+        });
+    });
+
     const secondaryColumnsBySlot = new Map<number, TeamScheduleColumn[]>();
-    const secondaryWods = generatedWods
-      .filter(({ track }) => track.schedule.floor === 'secondary')
-      .sort((first, second) => first.start - second.start || first.generatedWod.end - second.generatedWod.end || first.trackIndex - second.trackIndex);
-    let lastSecondarySlot = -1;
-    let lastSecondaryWodId = '';
-    let lastSecondaryColumn: TeamScheduleColumn | undefined;
-    let secondaryOccurrenceIndex = 0;
-
-    secondaryWods.forEach(({ track, generatedWod, start }) => {
-      const category = generatedWod.categories[0];
-      const slot = mainColumns.findIndex((mainColumn) => {
-        const categoryStart = mainCategoryStarts.get(mainColumn.wodId)?.get(category) ?? mainColumn.start;
-        return start <= categoryStart;
-      });
-      const secondarySlot = slot === -1 ? mainColumns.length : slot;
-      let column = secondarySlot === lastSecondarySlot && generatedWod.wod.id === lastSecondaryWodId
-        ? lastSecondaryColumn
-        : undefined;
-
-      if (!column) {
-        column = {
-          id: `${generatedWod.wod.id}-secondary-occurrence-${secondaryOccurrenceIndex}`,
-          wodId: generatedWod.wod.id,
-          name: generatedWod.wod.name,
-          schedule: track.schedule,
-          start,
-          secondarySlot,
-        };
-        secondaryOccurrenceIndex += 1;
-        const slotColumns = secondaryColumnsBySlot.get(secondarySlot) ?? [];
-        slotColumns.push(column);
-        secondaryColumnsBySlot.set(secondarySlot, slotColumns);
-      }
-
-      columnIds.set(generatedWod, column.id);
-      lastSecondarySlot = secondarySlot;
-      lastSecondaryWodId = generatedWod.wod.id;
-      lastSecondaryColumn = column;
+    secondaryColumnByKey.forEach((column) => {
+      const slot = column.secondarySlot ?? mainColumns.length;
+      const slotColumns = secondaryColumnsBySlot.get(slot) ?? [];
+      slotColumns.push(column);
+      secondaryColumnsBySlot.set(slot, slotColumns);
+    });
+    secondaryColumnsBySlot.forEach((slotColumns) => {
+      slotColumns.sort((first, second) =>
+        first.start - second.start
+        || first.name.localeCompare(second.name, 'fr')
+        || first.id.localeCompare(second.id),
+      );
     });
 
     const columns: TeamScheduleColumn[] = [];
@@ -1107,11 +2000,22 @@ export class App {
   private updateCompetition(update: (competition: Competition) => Competition): void {
     const selectedId = this.selectedCompetitionId();
     this.competitions.update((competitions) =>
-      competitions.map((competition) => (competition.id === selectedId ? update(competition) : competition)),
+      competitions.map((competition) => {
+        if (competition.id !== selectedId) return competition;
+        return {
+          ...update(competition),
+          optimizedSchedules: [],
+          activeScheduleId: null,
+          optimizedSchedule: null,
+        };
+      }),
     );
     this.generatedSchedule.set({ tracks: [] });
     this.scheduleDirty.set(true);
     this.teamSchedule.set(null);
+    this.optimizationError.set('');
+    this.scheduleEditError.set('');
+    this.scheduleExportError.set('');
   }
 
   private setCategoryPairDraft(competition: Competition | undefined): void {
@@ -1258,7 +2162,15 @@ export class App {
         const waves: ScheduledWave[] = Array.from({ length: waveCount }, (_, index) => {
           const start = batchStart + index * (duration + waveInterval);
           const capacity = baseWaveCapacity + (index < extraTeams ? 1 : 0);
-          return { number: index + 1, start, end: start + duration, teams: [], lanes: [], capacity };
+          return {
+            number: index + 1,
+            start,
+            end: start + duration,
+            teams: [],
+            lanes: [],
+            capacity,
+            lanePositions: LANE_ORDER.slice(0, capacity),
+          };
         });
         const end = waves[waves.length - 1].end;
         generatedWods.push({ wod, category: categories[0], categories, start: batchStart, end, waves });
@@ -1334,9 +2246,10 @@ export class App {
             end: placed.start + duration,
             teams: placed.teams.map((team) => team.id),
             lanes: placed.teams
-              .map((team, teamIndex) => ({ lane: this.laneForWod(wod, teamIndex), teamId: team.id }))
+              .map((team, teamIndex) => ({ lane: this.laneForWod(wod, teamIndex, 'secondary'), teamId: team.id }))
               .sort((first, second) => first.lane - second.lane),
             capacity,
+            lanePositions: Array.from({ length: capacity }, (_, lane) => lane + 1),
           };
           waves.push(wave);
           placed.teams.forEach((team) => {
@@ -1494,7 +2407,7 @@ export class App {
       reference.wave.teams = selected.map((team) => team.id);
       reference.wave.lanes = selected
         .map((team, index) => ({
-          lane: this.laneForWod(reference.generatedWod.wod, index),
+          lane: this.laneForWod(reference.generatedWod.wod, index, reference.track.schedule.floor),
           teamId: team.id,
         }))
         .sort((first, second) => first.lane - second.lane);
