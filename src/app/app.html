@@ -275,19 +275,26 @@
               <h2 id="schedule-rules-title">Ce que Timefold respecte</h2>
               <p class="rules-intro">Ces règles sont appliquées par le backend local avant d’afficher l’horaire.</p>
             </div>
-            <span class="rules-badge">Backend local</span>
+            <div class="section-heading-actions">
+              <span class="rules-badge">Backend local</span>
+              <button class="collapse-button" type="button" [attr.aria-expanded]="!rulesCollapsed()" aria-controls="rules-section-content" [attr.aria-label]="rulesCollapsed() ? 'Développer les règles d’optimisation' : 'Réduire les règles d’optimisation'" [title]="rulesCollapsed() ? 'Développer les règles d’optimisation' : 'Réduire les règles d’optimisation'" (click)="rulesCollapsed.update((collapsed) => !collapsed)">{{ rulesCollapsed() ? 'v' : '^' }}</button>
+            </div>
           </div>
-          <div class="rules-grid">
+          @if (!rulesCollapsed()) {
+          <div id="rules-section-content" class="section-collapsible">
+            <div class="rules-grid">
             <div class="rule-item"><span>01</span><div><strong>Intervalles exclusifs</strong><p>La pause dépend du contexte : entre vagues, entre catégories ou avant le prochain WOD. Ces temps ne s’additionnent pas.</p></div></div>
             <div class="rule-item"><span>02</span><div><strong>Horaire secondaire</strong><p>Les catégories peuvent alterner. Deux catégories fusionnées peuvent aussi partager une même vague afin de mieux remplir les lanes.</p></div></div>
             <div class="rule-item"><span>03</span><div><strong>Repos du floor 2</strong><p>Chaque équipe garde au moins 60 minutes avant et après un WOD du floor 2. Les pauses entre deux WODs du floor 1 suivent uniquement sa configuration.</p></div></div>
-            <div class="rule-item"><span>04</span><div><strong>Pauses prioritaires et équilibrées</strong><p>La qualité des temps de repos est favorisée dans l’ordre RX, Inter, puis Scaled/Master. Les pauses d’une même catégorie restent rapprochées et ciblent 1 h 15 ou 1 h 45.</p></div></div>
-            <div class="rule-item"><span>05</span><div><strong>Fins rapprochées</strong><p>Le floor 2 est placé avant, entre ou après les WODs principaux pour terminer le plus près possible du floor 1, selon les fenêtres de repos disponibles.</p></div></div>
+            <div class="rule-item"><span>04</span><div><strong>Pauses prioritaires et équilibrées</strong><p>À heure de fin égale, la qualité des pauses est favorisée dans l’ordre RX, Inter, puis Scaled/Master. Les pauses d’une même catégorie restent rapprochées et ciblent 1 h 15 ou 1 h 45.</p></div></div>
+            <div class="rule-item"><span>05</span><div><strong>Fin du floor 2</strong><p>Le floor 2 est planifié pour terminer le plus tôt possible, sans jamais dépasser l’heure de fin du floor 1.</p></div></div>
             <div class="rule-item"><span>06</span><div><strong>Ordre des équipes</strong><p>Sur l’horaire principal, les équipes suivent leur ordre d’entrée, du centre vers l’extérieur : 5, 6, 4, 7, 3, 8, 2, 9, 1, 10.</p></div></div>
             <div class="rule-item"><span>07</span><div><strong>Minimum de vagues</strong><p>Chaque groupe utilise le moins de vagues possible, puis les équipes sont réparties également : 37 équipes donnent 10, 9, 9 et 9.</p></div></div>
             <div class="rule-item"><span>08</span><div><strong>Horaires sauvegardés</strong><p>Chaque horaire généré reçoit son propre nom. Toutes les versions sont conservées avec la compétition, sélectionnables et supprimables avec confirmation.</p></div></div>
-          </div>
-        </section>
+            </div>
+           </div>
+           }
+         </section>
 
         <section class="generated-section" id="generated-schedule">
           <div class="generated-heading">

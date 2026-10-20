@@ -193,7 +193,7 @@ interface DeleteTarget {
 const CATEGORY_ORDER: Category[] = ['SCALED', 'MASTER', 'INTER', 'RX'];
 const LANE_ORDER = [5, 6, 4, 7, 3, 8, 2, 9, 1, 10];
 const MAX_IDEAL_PAUSE = 120;
-const SCHEDULE_ALGORITHM_VERSION = 5;
+const SCHEDULE_ALGORITHM_VERSION = 8;
 const STORAGE_KEY = 'crossfit-schedule.competitions';
 
 const sampleTeams: Team[] = [
@@ -299,6 +299,7 @@ export class App implements OnDestroy {
   readonly editingTeamId = signal<string | null>(null);
   readonly plannerCollapsed = signal(false);
   readonly teamsCollapsed = signal(false);
+  readonly rulesCollapsed = signal(true);
   readonly categoryPairError = signal('');
   readonly profileMenuOpen = signal(false);
   readonly authMode = signal<'login' | 'register'>('login');
@@ -384,7 +385,7 @@ export class App implements OnDestroy {
   teamBulkInput = '';
   teamEditName = '';
   generatedScheduleNames: string[] = [];
-  generatedScheduleCount = 3;
+  generatedScheduleCount = 1;
   readonly generationCounts = [1, 2, 3] as const;
   categoryPairDraft: CategoryPair = ['SCALED', 'MASTER'];
 
